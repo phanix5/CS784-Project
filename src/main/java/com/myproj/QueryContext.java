@@ -75,7 +75,4 @@ public class QueryContext {
         this.tau = tau;
     }
     
-    
-
-    
 }

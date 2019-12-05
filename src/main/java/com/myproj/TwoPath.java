@@ -21,11 +21,13 @@ public class TwoPath implements Query {
     private List<String> freeVarVals;
     private Double tau;
     private QueryContext ctx;
+    private int maxTreeDepth;
 
     public TwoPath(Connection conn, QueryContext ctx) {
         dbConn = conn;
         this.tau=ctx.getTau();
         this.ctx=ctx;
+        maxTreeDepth=0;
         freeVarVals = new ArrayList<>();
         tableR1 = new ArrayList<>();
         tableR2 = new ArrayList<>();
@@ -61,7 +63,7 @@ public class TwoPath implements Query {
         }
         
         public Double getTotalTimeBound(){
-            int leftCount=0,rightCount=0;
+            Double leftCount=0.0,rightCount=0.0;
             for(int i=startIndex;i<=endIndex;i++){
                 leftCount+=interval.get(i)[0];
                 rightCount+=interval.get(i)[1];
@@ -95,18 +97,19 @@ public class TwoPath implements Query {
 
         try {
             st = dbConn.createStatement();
-            ResultSet rs = st.executeQuery("SELECT COUNT(Y),Y FROM R1 GROUP BY Y ORDER BY Y");
+            ResultSet rs = st.executeQuery(getFreeVariableQuery(ctx.getDt1(), ctx.getDt1c2()));
+            int maxCount=0;
             while(rs.next()){
-                freeVarR1Map.put(rs.getString("y"), rs.getInt("count"));
-                freeVarValSet.add(rs.getString("y"));
+                freeVarR1Map.put(rs.getString(ctx.getDt1c2()), rs.getInt("count"));
+                freeVarValSet.add(rs.getString(ctx.getDt1c2()));
             }
-
-            rs = st.executeQuery("SELECT COUNT(X),X FROM R2 GROUP BY X ORDER BY X");
+            rs = st.executeQuery(getFreeVariableQuery(ctx.getDt2(), ctx.getDt2c1()));
             while(rs.next()){
-                freeVarR2Map.put(rs.getString("x"), rs.getInt("count"));
-                freeVarValSet.add(rs.getString("x"));
+                freeVarR2Map.put(rs.getString(ctx.getDt2c1()), rs.getInt("count"));
+                freeVarValSet.add(rs.getString(ctx.getDt2c1()));
+                maxCount = Math.max(maxCount, rs.getInt("count"));
             }
-
+            
             for(String val : freeVarValSet){
                 freeVarMap.put(val,new Integer[]{freeVarR1Map.getOrDefault(val,0),freeVarR2Map.getOrDefault(val,0)});
             }
@@ -115,7 +118,12 @@ public class TwoPath implements Query {
             freeVarMap.forEach((k,v)-> tupleCount.add(v));
             freeVarMap.forEach((k,v)-> freeVarVals.add(k));
             buildDelayBalancedTree(tupleCount, tau);
+            if(maxTreeDepth > 10){
+                System.out.println("Warning: Max tree depth too large, select a higher value of tau");
+                System.exit(1);
+            }
             buildDictionary();
+            System.out.println("Memory Usage: "+getMemoryStats(rootNode));
 
         } catch (SQLException e) {
             e.printStackTrace();
@@ -124,12 +132,37 @@ public class TwoPath implements Query {
 
     }
 
+    /*
+      No sanitization at all, woohoo!
+    */
+    private String getFreeVariableQuery(String dtName, String colName){
+        return "SELECT COUNT("+colName+"),"+colName+" FROM "+dtName+" GROUP BY "+colName+" ORDER BY " + colName;
+    }
+
+    /*
+        Come on, drop table -- :p
+    */
+    private String getTableQuery(String dtName, String col1, String col2, String order){
+        return "SELECT "+col1+","+col2+" FROM "+dtName+" ORDER BY "+order;
+    }
+
+    private String getJoinQuery(String rangeLeft, String rangeRight, String vb1, String vb2){
+        String r1x = ctx.getDt1()+"."+ctx.getDt1c1();
+        String r1y = ctx.getDt1()+"."+ctx.getDt1c2();
+        String r2x = ctx.getDt2()+"."+ctx.getDt2c1();
+        String r2y = ctx.getDt2()+"."+ctx.getDt2c2();
+
+        String query = "select "+r1y+" from "+ctx.getDt1()+" inner join "+ctx.getDt2()+" on "+r1y+"="
+        +r2x+" and "+r1y+" between "+ rangeLeft + " and " + rangeRight + " and "+r1x+"=" + vb1 + " and "+r2y+"=" + vb2;
+        return query;
+    }
+
     private void buildTree(TreeNode node, int level){
-        
+        maxTreeDepth=Math.max(maxTreeDepth,level);
         Double fullIntervalTimeBound = node.getTotalTimeBound();
-        //System.out.println(level+" : "+node.startIndex+" , "+node.endIndex);
         if(node.startIndex==node.endIndex || fullIntervalTimeBound<=tau/Math.pow(2, level/2.0))return;
-        int r1Count=0,r2Count=0,index=node.startIndex;
+        double r1Count=.0,r2Count=.0;
+        int index=node.startIndex;
         double currTimeBound=0;
         while(index<=node.endIndex){
             r1Count+=node.getR1Count(index);
@@ -158,13 +191,13 @@ public class TwoPath implements Query {
         Statement st;
         try {
             st = dbConn.createStatement();
-            ResultSet rs = st.executeQuery("SELECT * FROM R1 ORDER BY Y");
+            ResultSet rs = st.executeQuery(getTableQuery(ctx.getDt1(), ctx.getDt1c1(), ctx.getDt1c2(), ctx.getDt1c2()));
             while(rs.next()){
-                tableR1.add(new String[]{rs.getString("Y"),rs.getString("X")});
+                tableR1.add(new String[]{rs.getString(ctx.getDt1c2()),rs.getString(ctx.getDt1c1())});
             }
-            rs = st.executeQuery("SELECT * FROM R2 ORDER BY X");
+            rs = st.executeQuery(getTableQuery(ctx.getDt2(), ctx.getDt2c1(), ctx.getDt2c2(), ctx.getDt2c1()));
             while(rs.next()){
-                tableR2.add(new String[]{rs.getString("X"),rs.getString("Y")});
+                tableR2.add(new String[]{rs.getString(ctx.getDt2c1()),rs.getString(ctx.getDt2c2())});
             }
             buildDictionaryUtil(rootNode, 0);
         } catch (SQLException e) {
@@ -174,6 +207,7 @@ public class TwoPath implements Query {
     }
 
     private void buildDictionaryUtil(TreeNode node, int level){
+        //System.out.println(level);
         List<String[]> r1Sub = semiJoinWithNodeInterval(tableR1, node);
         List<String[]> r2Sub = semiJoinWithNodeInterval(tableR2, node);
 
@@ -208,7 +242,19 @@ public class TwoPath implements Query {
                             if(Math.sqrt(r1VbCount.get(vb1)*r2VbCount.get(vb2))>tau/Math.pow(2, level/2.0)){
                                 node.dictionary.put(key, 1);
                             }else{
-                                node.dictionary.put(key, 0);
+                            /**
+                             * Ignore the vb pair if not tau-heavy. In the paper the dictionary somehow knows
+                             * if a vb pair has a result in a node's interval. This means information about
+                             * light pairs are also stored (??). This would mean in the worst case, every (x,y)
+                             * pair is actually stored in the dict which means O(N^2) space, completely negating
+                             * the whole algorithm. Or this is what is my understanding.
+                             * 
+                             * So here's what I will do. I will not store light vb in dict and during evalaution,
+                             * if a pair does not appear in a dict then the join will be evaluated, and the result maybe
+                             * empty. Only when the vb pair is in th dict, I'll move to the child nodes to continue
+                             * evaluation.
+                             */
+                                //node.dictionary.put(key, 0);
                             }
                         }
                     }
@@ -239,36 +285,50 @@ public class TwoPath implements Query {
     @Override
     public void evaluate(String[] boundVals) {
         String vb1=boundVals[0], vb2=boundVals[1];
-
+        long stTime = System.currentTimeMillis();
         // DB will evaluate the join, once per tree node
-        evaluateUtil(rootNode, vb1, vb2);
-
+        long rowCount = evaluateUtil(rootNode, vb1, vb2);
+        long edTime = System.currentTimeMillis();
+        System.out.println("Result size: "+rowCount);
+        System.out.println("Answering Time (in ms): "+(edTime-stTime));
     }
 
-    private void evaluateUtil(TreeNode node, String vb1, String vb2){
+    private long evaluateUtil(TreeNode node, String vb1, String vb2){
         String key = generateKey(vb1, vb2);
         Statement st;
-        if(node.dictionary.containsKey(key)){
-            if(node.dictionary.get(key)==1 && (node.left!=null || node.right!=null)){
-                // Heavy valuation, move to child nodes if present
-                if(node.left!=null)evaluateUtil(node.left, vb1, vb2);
-                if(node.right!=null)evaluateUtil(node.right, vb1, vb2);
-            }else{
-                try {
-                    st=dbConn.createStatement();
-                    ResultSet rs = st.executeQuery("select r1.y from r1 inner join r2 on r1.y=r2.x and r1.y between "
-                            + freeVarVals.get(node.startIndex) + " and " + freeVarVals.get(node.endIndex) + " and r1.x="
-                            + vb1 + " and r2.y=" + vb2);
-                    while(rs.next()){
-                        System.out.println(rs.getString("y"));
-                    }
-                } catch (SQLException e) {
-                    
-                    e.printStackTrace();
+        long rowCount=0;
+        if(node.dictionary.containsKey(key) && node.dictionary.get(key)==1 && (node.left!=null || node.right!=null)){
+            // Heavy valuation, move to child nodes if present
+            if(node.left!=null)rowCount+=evaluateUtil(node.left, vb1, vb2);
+            if(node.right!=null)rowCount+=evaluateUtil(node.right, vb1, vb2);
+        }else{
+            try {
+                st=dbConn.createStatement();
+                
+                //System.out.println(getJoinQuery(freeVarVals.get(node.startIndex), freeVarVals.get(node.endIndex), vb1, vb2));
+                ResultSet rs = st.executeQuery(getJoinQuery(freeVarVals.get(node.startIndex), freeVarVals.get(node.endIndex), vb1, vb2));
+                while(rs.next()){
+                    //System.out.println(rs.getString(ctx.getDt1c2()));
+                    rowCount++;
                 }
+                
+                
+            } catch (SQLException e) {
+                e.printStackTrace();
             }
         }
-        // if dictionary doesn't contain key, then this interval does not have any valuation
+        return rowCount;
+    }
+
+    private int getMemoryStats(TreeNode node){
+        int memUsage = node.dictionary.size()*2 + 16; // treenode is 16 bytes min
+        if(node.left!=null){
+            memUsage+=getMemoryStats(node.left);
+        }
+        if(node.right!=null){
+            memUsage+=getMemoryStats(node.right);
+        }
+        return memUsage;
     }
 
     private String generateKey(String a, String b){
